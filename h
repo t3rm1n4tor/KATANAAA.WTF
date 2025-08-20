@@ -207,8 +207,7 @@ end
 local function queueOnTeleportHello()
     
         local suc, err = pcall(function()
-               queueonteleport(game:HttpGet(https://raw.githubusercontent.com/t3rm1n4tor/KATANAAA.WTF/main/h))
-
+               queueonteleport("loadstring(game:HttpGet('https://raw.githubusercontent.com/t3rm1n4tor/KATANAAA.WTF/main/h',true))();")
         end)
         if suc then
         warn("executed autoinject")
