@@ -207,7 +207,7 @@ end
 local function queueOnTeleportHello()
     
         local suc, err = pcall(function()
-               queueonteleport(game:HttpGet(https://github.com/t3rm1n4tor/KATANAAA.WTF/new/main))
+               queueonteleport(game:HttpGet(https://raw.githubusercontent.com/t3rm1n4tor/KATANAAA.WTF/main/h))
 
         end)
         if suc then
