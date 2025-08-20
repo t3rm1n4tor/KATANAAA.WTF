@@ -239,7 +239,8 @@ local state = {
 -- Initial humanoid health check → hop if 0
 do
     local hum = getHumanoid()
-    if hum and hum.Health <= 0 then
+    local ss = game.Players.LocalPlayer:GetAttribute("HasDied")
+    if ss == true then
         state.serverHopStarted = true
         serverHop()
         return
