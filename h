@@ -11,7 +11,8 @@ end)
 end)
 
 if game.PlaceId == 79546208627805 then
-return
+warn("that grow a garden wihih a wihuh a")
+    return
 end
 -- =============== Settings ===============
 local CHEST_KEYWORD = "chest"           -- model names containing "chest" (case-insensitive)
