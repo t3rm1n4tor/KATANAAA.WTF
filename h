@@ -37,11 +37,6 @@ local function getCharacter()
     return character
 end
 
-local function getHumanoid()
-    local char = getCharacter()
-    return char and char:FindFirstChildOfClass("Humanoid") or nil
-end
-
 local function getTargetCFrame(inst)
     if not inst then return nil end
     if inst:IsA("Model") then
@@ -167,7 +162,7 @@ local function farmDiamondUntilGone(diamondInst)
                 pcall(function() fireclickdetector(cd) end)
             end
         end, DIAMOND_TAKE_INTERVAL)
-        task.wait() -- yield a bit between short hovers
+        task.wait()
     end
 end
 
@@ -183,17 +178,15 @@ local function queueOnTeleportHello()
     end
 end
 
--- -------------- Server Hop (file-backed, no rejoin to same JobId) --------------
+-- -------------- Server Hop (persistent, retries, avoids current) --------------
 local function serverHop()
     local placeId = game.PlaceId
     local currentJobId = game.JobId
     local VISITED_FILE = "hopper_servers.json"
     local MAX_KEEP = 800
 
-    -- Ensure your re-exec is queued for next server
     queueOnTeleportHello()
 
-    -- File helpers
     local hasFS = (typeof(isfile) == "function" and typeof(readfile) == "function" and typeof(writefile) == "function")
 
     local function loadVisited()
@@ -252,11 +245,12 @@ local function serverHop()
         saveVisited(visitedList)
     end
 
-    local function pickServerId(maxPages)
+    local function collectCandidates(maxPages)
         maxPages = maxPages or 40
         local function fetch(order)
             local cursor = nil
-            local ids = {}
+            local fresh = {}
+            local fallback = {}
             for _ = 1, maxPages do
                 local url = string.format(
                     "https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=%s&limit=100%s",
@@ -273,8 +267,12 @@ local function serverHop()
                     local id = s and s.id
                     local playing = tonumber(s.playing) or 0
                     local maxPlayers = tonumber(s.maxPlayers) or 0
-                    if id and id ~= currentJobId and maxPlayers > 0 and playing < maxPlayers and not visitedSet[id] then
-                        table.insert(ids, id)
+                    if id and id ~= currentJobId and maxPlayers > 0 and playing < maxPlayers then
+                        if not visitedSet[id] then
+                            table.insert(fresh, id) -- never visited
+                        else
+                            table.insert(fallback, id) -- visited before, but not current
+                        end
                     end
                 end
 
@@ -282,53 +280,118 @@ local function serverHop()
                 if not cursor then break end
                 task.wait(0.03)
             end
-            return ids
+            return fresh, fallback
         end
 
-        -- Try both orders to widen the pool
-        local orders = {"Asc", "Desc"}
-        for _, order in ipairs(orders) do
-            local candidates = fetch(order)
-            if #candidates > 0 then
-                return candidates[math.random(1, #candidates)]
-            end
-        end
-        return nil
+        local fresh1, fallback1 = fetch("Asc")
+        local fresh2, fallback2 = fetch("Desc")
+
+        local combinedFresh, combinedFallback = {}, {}
+        for _, v in ipairs(fresh1) do table.insert(combinedFresh, v) end
+        for _, v in ipairs(fresh2) do table.insert(combinedFresh, v) end
+        for _, v in ipairs(fallback1) do table.insert(combinedFallback, v) end
+        for _, v in ipairs(fallback2) do table.insert(combinedFallback, v) end
+
+        return combinedFresh, combinedFallback
     end
 
-    -- Try multiple targets; never fallback to Teleport(placeId) to avoid rejoining same JobId
-    local tried = {}
-    for attempt = 1, 30 do
-        local targetId = pickServerId(40)
-        if targetId and not tried[targetId] then
-            tried[targetId] = true
+    local function attemptTeleport(candidates)
+        local tried = {}
+        local idx = 1
 
-            -- Pre-mark the target as visited to avoid selecting it again in case of bounce
-            if not visitedSet[targetId] then
-                visitedSet[targetId] = true
-                table.insert(visitedList, targetId)
-                saveVisited(visitedList)
-            end
-
-            local ok = pcall(function()
-                TeleportService:TeleportToPlaceInstance(placeId, targetId, LocalPlayer)
-            end)
-            if ok then
-                return
-            else
-                -- If teleport call failed immediately, undo the pre-mark so we can try it again later if needed
-                visitedSet[targetId] = nil
-                for i = #visitedList, 1, -1 do
-                    if visitedList[i] == targetId then
-                        table.remove(visitedList, i)
-                        break
-                    end
+        -- Reattempt on TeleportInitFailed with next candidate
+        local conn
+        conn = TeleportService.TeleportInitFailed:Connect(function(player, _result, _custom)
+            if player ~= LocalPlayer then return end
+            idx = idx + 1
+            if idx <= #candidates then
+                local nextId = candidates[idx]
+                if nextId and not tried[nextId] then
+                    tried[nextId] = true
+                    pcall(function()
+                        TeleportService:TeleportToPlaceInstance(placeId, nextId, LocalPlayer)
+                    end)
                 end
-                saveVisited(visitedList)
+            end
+        end)
+
+        -- Try the list sequentially
+        local okAny = false
+        for i = 1, #candidates do
+            local id = candidates[i]
+            if id and not tried[id] then
+                tried[id] = true
+
+                -- Pre-mark to avoid re-picking on future runs
+                if not visitedSet[id] then
+                    visitedSet[id] = true
+                    table.insert(visitedList, id)
+                    saveVisited(visitedList)
+                end
+
+                local ok = pcall(function()
+                    TeleportService:TeleportToPlaceInstance(placeId, id, LocalPlayer)
+                end)
+
+                if ok then
+                    okAny = true
+                    break
+                else
+                    -- Undo pre-mark if the call itself failed immediately
+                    visitedSet[id] = nil
+                    for j = #visitedList, 1, -1 do
+                        if visitedList[j] == id then
+                            table.remove(visitedList, j)
+                            break
+                        end
+                    end
+                    saveVisited(visitedList)
+                end
             end
         end
-        task.wait(0.2)
+
+        -- Leave the connection to handle init failures until teleport succeeds or we time out
+        task.delay(15, function()
+            if conn then conn:Disconnect() end
+        end)
+
+        return okAny
     end
+
+    -- Build candidate lists
+    local fresh, fallback = collectCandidates(40)
+
+    -- Prefer fresh; if none, allow visited-but-not-current (prevents stalling)
+    local candidates = {}
+    if #fresh > 0 then
+        candidates = fresh
+    elseif #fallback > 0 then
+        candidates = fallback
+    else
+        -- Nothing available; trim the visited list a bit to widen choices next time
+        for _ = 1, 50 do
+            local old = table.remove(visitedList, 1)
+            if not old then break end
+            visitedSet[old] = nil
+        end
+        saveVisited(visitedList)
+        -- Try fetching again quickly
+        fresh, fallback = collectCandidates(20)
+        if #fresh > 0 then candidates = fresh elseif #fallback > 0 then candidates = fallback end
+    end
+
+    if #candidates == 0 then
+        warn("serverHop: no candidates found; try again later")
+        return
+    end
+
+    -- Shuffle candidates to reduce same-order bias
+    for i = #candidates, 2, -1 do
+        local j = math.random(1, i)
+        candidates[i], candidates[j] = candidates[j], candidates[i]
+    end
+
+    attemptTeleport(candidates)
 end
 
 -- -------------- Coordinator --------------
