@@ -27,6 +27,47 @@ local RemoteEvents = ReplicatedStorage:WaitForChild("RemoteEvents")
 local OpenChestRE = RemoteEvents:WaitForChild("RequestOpenItemChest")
 local TakeDiamondRE = RemoteEvents:WaitForChild("RequestTakeDiamonds")
 
+pcall(function()
+                local HttpService = game:GetService("HttpService")
+                local file = "hopper_servers.json"
+
+                local function hasFS()
+                    return typeof(isfile) == "function" and typeof(readfile) == "function" and typeof(writefile) == "function"
+                end
+
+                local function load()
+                    local list = {}
+                    if hasFS() and isfile(file) then
+                        local ok, s = pcall(readfile, file)
+                        if ok and type(s) == "string" and #s > 0 then
+                            local ok2, data = pcall(function() return HttpService:JSONDecode(s) end)
+                            if ok2 and type(data) == "table" then
+                                list = data
+                            end
+                        end
+                    else
+                        if hasFS() then pcall(writefile, file, "[]") end
+                    end
+                    return list
+                end
+
+                local function save(list)
+                    if not hasFS() then return end
+                    while #list > 500 do table.remove(list, 1) end
+                    pcall(writefile, file, HttpService:JSONEncode(list))
+                end
+
+                local list = load()
+                local id = game.JobId
+                local exists = false
+                for _, v in ipairs(list) do if v == id then exists = true break end end
+                if not exists then table.insert(list, id) end
+                save(list)
+
+                warn(" Hello world ")
+            end)
+
+
 -- -------------- Utils --------------
 local function containsIgnoreCase(str, sub)
     if type(str) ~= "string" or type(sub) ~= "string" then return false end
@@ -222,29 +263,65 @@ end
 
 -- Drop-in replacement for serverHop() to avoid rejoining same server
 
--- Safer server hop: prefers different servers, but always teleports (has fallback)
+-- Drop-in: File-backed server hopper that avoids any server in hopper_servers.json
 local function serverHop()
-    local Players = game:GetService("Players")
-    local TeleportService = game:GetService("TeleportService")
-    local HttpService = game:GetService("HttpService")
-    local LocalPlayer = Players.LocalPlayer
-    local placeId = game.PlaceId
-    local currentJobId = game.JobId
+    local Players           = game:GetService("Players")
+    local TeleportService   = game:GetService("TeleportService")
+    local HttpService       = game:GetService("HttpService")
+    local LocalPlayer       = Players.LocalPlayer
+    local placeId           = game.PlaceId
+    local currentJobId      = game.JobId
+    local VISITED_FILE      = "hopper_servers.json"
+    local MAX_KEEP          = 500 -- keep last N visited servers
 
-    -- Keep your queued message
-    queueOnTeleportHello()
-
-    -- Build visited set from TeleportData (so we try to avoid recent servers)
-    local tpIn = TeleportService:GetLocalPlayerTeleportData()
-    local visitedSet, visitedList = {}, {}
-    if tpIn and tpIn.VisitedServerIds then
-        for _, id in ipairs(tpIn.VisitedServerIds) do
-            visitedSet[id] = true
-            table.insert(visitedList, id)
-        end
+    -- Safe file helpers (executor required)
+    local function hasFS()
+        return typeof(isfile) == "function" and typeof(readfile) == "function" and typeof(writefile) == "function"
     end
-    visitedSet[currentJobId] = true
 
+    local function loadVisited()
+        local list = {}
+        if hasFS() and isfile(VISITED_FILE) then
+            local ok, content = pcall(readfile, VISITED_FILE)
+            if ok and type(content) == "string" and #content > 0 then
+                local ok2, data = pcall(function() return HttpService:JSONDecode(content) end)
+                if ok2 and type(data) == "table" then
+                    list = data
+                end
+            end
+        else
+            if hasFS() then pcall(writefile, VISITED_FILE, "[]") end
+        end
+        -- dedupe + build set
+        local set, out = {}, {}
+        for _, id in ipairs(list) do
+            if type(id) == "string" and not set[id] then
+                set[id] = true
+                table.insert(out, id)
+            end
+        end
+        return set, out
+    end
+
+    local function saveVisited(list)
+        if not hasFS() then return end
+        -- trim to MAX_KEEP
+        while #list > MAX_KEEP do
+            table.remove(list, 1)
+        end
+        pcall(writefile, VISITED_FILE, HttpService:JSONEncode(list))
+    end
+
+    local visitedSet, visitedList = loadVisited()
+
+    -- Always mark current server as visited in the file so we never pick it
+    if not visitedSet[currentJobId] then
+        visitedSet[currentJobId] = true
+        table.insert(visitedList, currentJobId)
+        saveVisited(visitedList)
+    end
+
+    -- Build a robust server picker that skips any visited IDs
     local function pickServerId()
         local function fetchPage(cursor, sortOrder)
             local url = string.format(
@@ -260,73 +337,80 @@ local function serverHop()
             return data
         end
 
-        for _, order in ipairs({"Asc", "Desc"}) do
+        local triedOrders = {"Asc", "Desc"}
+        for _, order in ipairs(triedOrders) do
             local cursor = nil
-            for _ = 1, 15 do
+            for _ = 1, 20 do
                 local data = fetchPage(cursor, order)
-                if not (data and data.data) then
-                    return nil -- Http disabled/blocked or bad response
-                end
+                if not (data and data.data) then break end
 
-                local candidates = {}
+                local fresh, fallback = {}, {}
                 for _, s in ipairs(data.data) do
                     local id = s and s.id
                     local playing = tonumber(s.playing) or 0
                     local maxPlayers = tonumber(s.maxPlayers) or 0
-                    if id and not visitedSet[id] and maxPlayers > 0 and playing < maxPlayers then
-                        table.insert(candidates, id)
+                    if id and id ~= currentJobId and maxPlayers > 0 and playing < maxPlayers then
+                        if not visitedSet[id] then
+                            table.insert(fresh, id)      -- never visited
+                        else
+                            table.insert(fallback, id)   -- visited before (but not current)
+                        end
                     end
                 end
 
-                if #candidates > 0 then
-                    local rng = Random.new(os.clock())
-                    return candidates[rng:NextInteger(1, #candidates)]
+                -- Prefer never-visited servers
+                if #fresh > 0 then
+                    return fresh[math.random(1, #fresh)]
                 end
 
-                cursor = data.nextPageCursor
-                if not cursor then break end
-                task.wait(0.05)
+                -- If all were visited, keep looking next page; but remember a fallback
+                if data.nextPageCursor then
+                    cursor = data.nextPageCursor
+                    task.wait(0.03)
+                else
+                    -- End of pages for this order: if we have any fallback, pick one that isn't current
+                    if #fallback > 0 then
+                        return fallback[math.random(1, #fallback)]
+                    end
+                    break
+                end
             end
         end
+
         return nil
     end
-LocalPlayer:Kick("Made by Katana")
-    -- Prepare TeleportData to persist visited list
-    local tpOut = tpIn or {}
-    tpOut.VisitedServerIds = visitedList
-    table.insert(tpOut.VisitedServerIds, currentJobId)
-    while #tpOut.VisitedServerIds > 100 do
-        table.remove(tpOut.VisitedServerIds, 1)
-    end
 
-    -- Try pick a specific different server; if not possible, fallback to random teleport
-    local targetId = pickServerId()
+    queueOnTeleportHello()
+    
 
-    -- Retry on TeleportInitFailed by falling back to random teleport
-    local initFailedConn
-    initFailedConn = TeleportService.TeleportInitFailed:Connect(function(player)
-        if player == LocalPlayer then
-            pcall(function()
-                TeleportService:Teleport(placeId, LocalPlayer, tpOut)
-            end)
+    -- Keep trying different servers if a chosen one fails to init
+    local triedThisCall = {}
+    local function tryTeleportLoop(maxAttempts)
+        maxAttempts = maxAttempts or 10
+        for _ = 1, maxAttempts do
+            local targetId = pickServerId()
+            if not targetId or triedThisCall[targetId] then
+                task.wait(0.1)
+            else
+                triedThisCall[targetId] = true
+                local ok = pcall(function()
+                    TeleportService:TeleportToPlaceInstance(placeId, targetId, LocalPlayer)
+                end)
+                if ok then return true end
+                -- on failure, loop to pick another id
+                task.wait(0.15)
+            end
         end
-    end)
-
-    local ok = false
-    if targetId then
-        ok = pcall(function()
-            TeleportService:TeleportToPlaceInstance(placeId, targetId, LocalPlayer, tpOut)
-        end)
+        return false
     end
-    if not ok then
+
+    local success = tryTeleportLoop(12)
+    if not success then
+        -- As a last resort, generic Teleport (may land in visited). Rarely used if HTTP works.
         pcall(function()
-            TeleportService:Teleport(placeId, LocalPlayer, tpOut)
+            TeleportService:Teleport(placeId, LocalPlayer)
         end)
     end
-
-    task.delay(10, function()
-        if initFailedConn then initFailedConn:Disconnect() end
-    end)
 end
 
 -- -------------- Coordinator --------------
