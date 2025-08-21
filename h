@@ -1,3 +1,4 @@
+
 -- LocalScript: Chest opener (hover) + Exact Diamond priority + Server hop using remotes
 task.spawn(function()
     local rs = game:GetService("RunService")
@@ -8,6 +9,10 @@ rs.RenderStepped:Connect(function()
     player.GameplayPaused = false
 end)
 end)
+
+if game.PlaceId == 79546208627805 then
+return
+end
 -- =============== Settings ===============
 local CHEST_KEYWORD = "chest"           -- model names containing "chest" (case-insensitive)
 local DIAMOND_NAME = "Diamond"          -- exact name match for diamonds
