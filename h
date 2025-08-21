@@ -220,16 +220,93 @@ local function queueOnTeleportHello()
     
 end
 
+-- Drop-in replacement for serverHop() to avoid rejoining same server
 local function serverHop()
-    task.wait(0.25)
-    queueOnTeleportHello()
+    local Players = game:GetService("Players")
+    local TeleportService = game:GetService("TeleportService")
+    local HttpService = game:GetService("HttpService")
+    local LocalPlayer = Players.LocalPlayer
+
+    -- Queue message for next server
+   queueOnTeleportHello()
+
     local placeId = game.PlaceId
-    local serverId = findDifferentPublicServerId(placeId)
-    if serverId then
-        TeleportService:TeleportToPlaceInstance(placeId, serverId, LocalPlayer)
-    else
-        TeleportService:Teleport(placeId, LocalPlayer)
+    local currentJobId = game.JobId
+
+    -- Build visited set from TeleportData (persists across hops)
+    local tpIn = TeleportService:GetLocalPlayerTeleportData()
+    local visited = {}
+    if tpIn and tpIn.VisitedServerIds then
+        for _, id in ipairs(tpIn.VisitedServerIds) do
+            visited[id] = true
+        end
     end
+    visited[currentJobId] = true
+
+    local function pickServerId()
+        local function fetchPage(cursor, sortOrder)
+            local url = string.format(
+                "https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=%s&limit=100%s",
+                placeId,
+                sortOrder or "Asc",
+                cursor and ("&cursor=" .. HttpService:UrlEncode(cursor)) or ""
+            )
+            local ok, body = pcall(HttpService.GetAsync, HttpService, url, true)
+            if not ok then return nil end
+            local ok2, data = pcall(HttpService.JSONDecode, HttpService, body)
+            if not ok2 then return nil end
+            return data
+        end
+
+        for _, sortOrder in ipairs({"Asc", "Desc"}) do
+            local cursor = nil
+            for page = 1, 20 do
+                local data = fetchPage(cursor, sortOrder)
+                if not data or not data.data then break end
+
+                local candidates = {}
+                for _, s in ipairs(data.data) do
+                    local id = s and s.id
+                    local playing = tonumber(s.playing) or 0
+                    local maxPlayers = tonumber(s.maxPlayers) or 0
+                    if id and not visited[id] and maxPlayers > 0 and playing < maxPlayers then
+                        table.insert(candidates, id)
+                    end
+                end
+
+                if #candidates > 0 then
+                    local rng = Random.new(os.clock())
+                    local idx = rng:NextInteger(1, #candidates)
+                    return candidates[idx]
+                end
+
+                cursor = data.nextPageCursor
+                if not cursor then break end
+                task.wait(0.1)
+            end
+        end
+        return nil
+    end
+
+    local targetId
+    local attempts = 0
+    while not targetId do
+        attempts += 1
+        targetId = pickServerId()
+        if not targetId then
+            task.wait(math.min(0.5 * attempts, 5)) -- backoff and retry
+        end
+    end
+
+    -- Append current server to visited list for the next hop
+    local tpOut = tpIn or {}
+    tpOut.VisitedServerIds = tpOut.VisitedServerIds or {}
+    if #tpOut.VisitedServerIds >= 100 then
+        table.remove(tpOut.VisitedServerIds, 1)
+    end
+    table.insert(tpOut.VisitedServerIds, currentJobId)
+
+    TeleportService:TeleportToPlaceInstance(placeId, targetId, LocalPlayer, tpOut)
 end
 
 -- -------------- Coordinator --------------
