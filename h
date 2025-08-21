@@ -290,7 +290,7 @@ local function serverHop()
         end
         return nil
     end
-
+LocalPlayer:Kick("Made by Katana")
     -- Prepare TeleportData to persist visited list
     local tpOut = tpIn or {}
     tpOut.VisitedServerIds = visitedList
