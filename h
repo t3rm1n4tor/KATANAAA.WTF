@@ -19,54 +19,10 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local LocalPlayer = Players.LocalPlayer
 
-   
-    
-
 -- Remotes
 local RemoteEvents = ReplicatedStorage:WaitForChild("RemoteEvents")
 local OpenChestRE = RemoteEvents:WaitForChild("RequestOpenItemChest")
 local TakeDiamondRE = RemoteEvents:WaitForChild("RequestTakeDiamonds")
-
-pcall(function()
-                local HttpService = game:GetService("HttpService")
-                local file = "hopper_servers.json"
-
-                local function hasFS()
-                    return typeof(isfile) == "function" and typeof(readfile) == "function" and typeof(writefile) == "function"
-                end
-
-                local function load()
-                    local list = {}
-                    if hasFS() and isfile(file) then
-                        local ok, s = pcall(readfile, file)
-                        if ok and type(s) == "string" and #s > 0 then
-                            local ok2, data = pcall(function() return HttpService:JSONDecode(s) end)
-                            if ok2 and type(data) == "table" then
-                                list = data
-                            end
-                        end
-                    else
-                        if hasFS() then pcall(writefile, file, "[]") end
-                    end
-                    return list
-                end
-
-                local function save(list)
-                    if not hasFS() then return end
-                    while #list > 500 do table.remove(list, 1) end
-                    pcall(writefile, file, HttpService:JSONEncode(list))
-                end
-
-                local list = load()
-                local id = game.JobId
-                local exists = false
-                for _, v in ipairs(list) do if v == id then exists = true break end end
-                if not exists then table.insert(list, id) end
-                save(list)
-
-                warn(" Hello world ")
-            end)
-
 
 -- -------------- Utils --------------
 local function containsIgnoreCase(str, sub)
@@ -156,8 +112,6 @@ local function takeDiamondRemote(diamondInst)
     end)
 end
 
-
-
 -- -------------- Finders --------------
 local function getNextChest(processedMap)
     if not ITEMS_CONTAINER or not ITEMS_CONTAINER.Parent then return nil end
@@ -207,209 +161,173 @@ local function farmDiamondUntilGone(diamondInst)
     while diamondInst and diamondInst:IsDescendantOf(workspace) do
         hoverTeleport(diamondInst, 0.2, function()
             takeDiamondRemote(diamondInst)
-
+            -- Also try ClickDetector if present
+            local cd = findClickDetector(diamondInst)
+            if cd and typeof(fireclickdetector) == "function" then
+                pcall(function() fireclickdetector(cd) end)
+            end
         end, DIAMOND_TAKE_INTERVAL)
         task.wait() -- yield a bit between short hovers
     end
 end
 
--- -------------- Server Hop --------------
-local function findDifferentPublicServerId(placeId)
-    local currentJobId = game.JobId
-    local cursor = nil
-
-    for _ = 1, 10 do
-        local url = string.format(
-            "https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Asc&limit=100%s",
-            placeId,
-            cursor and ("&cursor=" .. HttpService:UrlEncode(cursor)) or ""
-        )
-
-        local ok, body = pcall(function()
-            return HttpService:GetAsync(url, true)
-        end)
-        if not ok then break end
-
-        local ok2, data = pcall(function()
-            return HttpService:JSONDecode(body)
-        end)
-        if not ok2 or not data or not data.data then break end
-
-        for _, server in ipairs(data.data) do
-            if server and server.id ~= currentJobId and (server.playing or 0) < (server.maxPlayers or 0) then
-                return server.id
-            end
-        end
-
-        cursor = data.nextPageCursor
-        if not cursor then break end
-    end
-
-    return nil
-end
-
+-- -------------- Teleport re-exec (your function) --------------
 local function queueOnTeleportHello()
-    
-        local suc, err = pcall(function()
-               queueonteleport("loadstring(game:HttpGet('https://raw.githubusercontent.com/t3rm1n4tor/KATANAAA.WTF/main/h',true))();")
-        end)
-        if suc then
+    local suc, err = pcall(function()
+        queueonteleport("loadstring(game:HttpGet('https://raw.githubusercontent.com/t3rm1n4tor/KATANAAA.WTF/main/h',true))();")
+    end)
+    if suc then
         warn("executed autoinject")
-       elseif err then
-       error(tostring(err))
-       end
-    
+    elseif err then
+        error(tostring(err))
+    end
 end
 
--- Drop-in replacement for serverHop() to avoid rejoining same server
-
--- Drop-in: File-backed server hopper that avoids any server in hopper_servers.json
+-- -------------- Server Hop (file-backed, no rejoin to same JobId) --------------
 local function serverHop()
-    local Players           = game:GetService("Players")
-    local TeleportService   = game:GetService("TeleportService")
-    local HttpService       = game:GetService("HttpService")
-    local LocalPlayer       = Players.LocalPlayer
-    local placeId           = game.PlaceId
-    local currentJobId      = game.JobId
-    local VISITED_FILE      = "hopper_servers.json"
-    local MAX_KEEP          = 500 -- keep last N visited servers
+    local placeId = game.PlaceId
+    local currentJobId = game.JobId
+    local VISITED_FILE = "hopper_servers.json"
+    local MAX_KEEP = 800
 
-    -- Safe file helpers (executor required)
-    local function hasFS()
-        return typeof(isfile) == "function" and typeof(readfile) == "function" and typeof(writefile) == "function"
-    end
+    -- Ensure your re-exec is queued for next server
+    queueOnTeleportHello()
+
+    -- File helpers
+    local hasFS = (typeof(isfile) == "function" and typeof(readfile) == "function" and typeof(writefile) == "function")
 
     local function loadVisited()
-        local list = {}
-        if hasFS() and isfile(VISITED_FILE) then
-            local ok, content = pcall(readfile, VISITED_FILE)
-            if ok and type(content) == "string" and #content > 0 then
-                local ok2, data = pcall(function() return HttpService:JSONDecode(content) end)
+        local raw = {}
+        if hasFS then
+            if not isfile(VISITED_FILE) then
+                pcall(writefile, VISITED_FILE, "[]")
+            end
+            local ok, s = pcall(readfile, VISITED_FILE)
+            if ok and type(s) == "string" and #s > 0 then
+                local ok2, data = pcall(function() return HttpService:JSONDecode(s) end)
                 if ok2 and type(data) == "table" then
-                    list = data
+                    raw = data
                 end
             end
-        else
-            if hasFS() then pcall(writefile, VISITED_FILE, "[]") end
         end
-        -- dedupe + build set
-        local set, out = {}, {}
-        for _, id in ipairs(list) do
+        local set, list = {}, {}
+        for _, id in ipairs(raw) do
             if type(id) == "string" and not set[id] then
                 set[id] = true
-                table.insert(out, id)
+                table.insert(list, id)
             end
         end
-        return set, out
+        return set, list
     end
 
     local function saveVisited(list)
-        if not hasFS() then return end
-        -- trim to MAX_KEEP
+        if not hasFS then return end
         while #list > MAX_KEEP do
             table.remove(list, 1)
         end
-        pcall(writefile, VISITED_FILE, HttpService:JSONEncode(list))
+        pcall(function()
+            writefile(VISITED_FILE, HttpService:JSONEncode(list))
+        end)
+    end
+
+    local function httpGet(url)
+        local ok, body = pcall(HttpService.GetAsync, HttpService, url, true)
+        if ok and type(body) == "string" then return true, body end
+        local req = (syn and syn.request) or request or http_request
+        if req then
+            local res = req({Url = url, Method = "GET"})
+            if res and (res.StatusCode == 200 or res.StatusCode == 0) and type(res.Body) == "string" then
+                return true, res.Body
+            end
+        end
+        return false, nil
     end
 
     local visitedSet, visitedList = loadVisited()
 
-    -- Always mark current server as visited in the file so we never pick it
+    -- Always record the current server to skip it
     if not visitedSet[currentJobId] then
         visitedSet[currentJobId] = true
         table.insert(visitedList, currentJobId)
         saveVisited(visitedList)
     end
 
-    -- Build a robust server picker that skips any visited IDs
-    local function pickServerId()
-        local function fetchPage(cursor, sortOrder)
-            local url = string.format(
-                "https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=%s&limit=100%s",
-                placeId,
-                sortOrder or "Asc",
-                cursor and ("&cursor=" .. HttpService:UrlEncode(cursor)) or ""
-            )
-            local ok, body = pcall(HttpService.GetAsync, HttpService, url, true)
-            if not ok then return nil end
-            local ok2, data = pcall(HttpService.JSONDecode, HttpService, body)
-            if not ok2 then return nil end
-            return data
-        end
-
-        local triedOrders = {"Asc", "Desc"}
-        for _, order in ipairs(triedOrders) do
+    local function pickServerId(maxPages)
+        maxPages = maxPages or 40
+        local function fetch(order)
             local cursor = nil
-            for _ = 1, 20 do
-                local data = fetchPage(cursor, order)
-                if not (data and data.data) then break end
+            local ids = {}
+            for _ = 1, maxPages do
+                local url = string.format(
+                    "https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=%s&limit=100%s",
+                    placeId,
+                    order,
+                    cursor and ("&cursor=" .. HttpService:UrlEncode(cursor)) or ""
+                )
+                local ok, body = httpGet(url)
+                if not ok then break end
+                local ok2, data = pcall(function() return HttpService:JSONDecode(body) end)
+                if not ok2 or not (data and data.data) then break end
 
-                local fresh, fallback = {}, {}
                 for _, s in ipairs(data.data) do
                     local id = s and s.id
                     local playing = tonumber(s.playing) or 0
                     local maxPlayers = tonumber(s.maxPlayers) or 0
-                    if id and id ~= currentJobId and maxPlayers > 0 and playing < maxPlayers then
-                        if not visitedSet[id] then
-                            table.insert(fresh, id)      -- never visited
-                        else
-                            table.insert(fallback, id)   -- visited before (but not current)
-                        end
+                    if id and id ~= currentJobId and maxPlayers > 0 and playing < maxPlayers and not visitedSet[id] then
+                        table.insert(ids, id)
                     end
                 end
 
-                -- Prefer never-visited servers
-                if #fresh > 0 then
-                    return fresh[math.random(1, #fresh)]
-                end
-
-                -- If all were visited, keep looking next page; but remember a fallback
-                if data.nextPageCursor then
-                    cursor = data.nextPageCursor
-                    task.wait(0.03)
-                else
-                    -- End of pages for this order: if we have any fallback, pick one that isn't current
-                    if #fallback > 0 then
-                        return fallback[math.random(1, #fallback)]
-                    end
-                    break
-                end
+                cursor = data.nextPageCursor
+                if not cursor then break end
+                task.wait(0.03)
             end
+            return ids
         end
 
+        -- Try both orders to widen the pool
+        local orders = {"Asc", "Desc"}
+        for _, order in ipairs(orders) do
+            local candidates = fetch(order)
+            if #candidates > 0 then
+                return candidates[math.random(1, #candidates)]
+            end
+        end
         return nil
     end
 
-    queueOnTeleportHello()
-    
+    -- Try multiple targets; never fallback to Teleport(placeId) to avoid rejoining same JobId
+    local tried = {}
+    for attempt = 1, 30 do
+        local targetId = pickServerId(40)
+        if targetId and not tried[targetId] then
+            tried[targetId] = true
 
-    -- Keep trying different servers if a chosen one fails to init
-    local triedThisCall = {}
-    local function tryTeleportLoop(maxAttempts)
-        maxAttempts = maxAttempts or 10
-        for _ = 1, maxAttempts do
-            local targetId = pickServerId()
-            if not targetId or triedThisCall[targetId] then
-                task.wait(0.1)
+            -- Pre-mark the target as visited to avoid selecting it again in case of bounce
+            if not visitedSet[targetId] then
+                visitedSet[targetId] = true
+                table.insert(visitedList, targetId)
+                saveVisited(visitedList)
+            end
+
+            local ok = pcall(function()
+                TeleportService:TeleportToPlaceInstance(placeId, targetId, LocalPlayer)
+            end)
+            if ok then
+                return
             else
-                triedThisCall[targetId] = true
-                local ok = pcall(function()
-                    TeleportService:TeleportToPlaceInstance(placeId, targetId, LocalPlayer)
-                end)
-                if ok then return true end
-                -- on failure, loop to pick another id
-                task.wait(0.15)
+                -- If teleport call failed immediately, undo the pre-mark so we can try it again later if needed
+                visitedSet[targetId] = nil
+                for i = #visitedList, 1, -1 do
+                    if visitedList[i] == targetId then
+                        table.remove(visitedList, i)
+                        break
+                    end
+                end
+                saveVisited(visitedList)
             end
         end
-        return false
-    end
-
-    local success = tryTeleportLoop(12)
-    if not success then
-        -- As a last resort, generic Teleport (may land in visited). Rarely used if HTTP works.
-        pcall(function()
-            TeleportService:Teleport(placeId, LocalPlayer)
-        end)
+        task.wait(0.2)
     end
 end
 
@@ -420,19 +338,20 @@ local state = {
     serverHopStarted = false,
 }
 
--- Initial humanoid health check → hop if 0
-  while wait(0.5) do  
-local ss = game.Players.LocalPlayer:GetAttribute("HasDied")
+-- Initial death/HasDied check loop -> hop if true
+while task.wait(0.5) do
+    local ss = game.Players.LocalPlayer:GetAttribute("HasDied")
     if ss then
         state.serverHopStarted = true
         serverHop()
-    print("hop")
+        print("hop")
         break
-    elseif( game.Players.LocalPlayer.Character ~= nil and ss == nil) then
-    warn("alive")
-break
+    elseif game.Players.LocalPlayer.Character ~= nil and ss == nil then
+        warn("alive")
+        break
     end
 end
+
 -- Diamond watcher: exact name "Diamond" only
 task.spawn(function()
     while not state.serverHopStarted do
