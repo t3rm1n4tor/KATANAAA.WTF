@@ -178,48 +178,60 @@ local function queueOnTeleportHello()
     end
 end
 
--- -------------- Server Hop (persistent, retries, avoids current) --------------
+-- -------------- Server Hop (persistent, per-place, keeps trying) --------------
 local function serverHop()
     local placeId = game.PlaceId
     local currentJobId = game.JobId
     local VISITED_FILE = "hopper_servers.json"
-    local MAX_KEEP = 800
+    local MAX_KEEP = 1000
 
     queueOnTeleportHello()
 
     local hasFS = (typeof(isfile) == "function" and typeof(readfile) == "function" and typeof(writefile) == "function")
 
+    -- Read/write visited DB as a per-place map: { ["<placeId>"] = { "<jobId>", ... } }
     local function loadVisited()
-        local raw = {}
+        local db = {}
         if hasFS then
             if not isfile(VISITED_FILE) then
-                pcall(writefile, VISITED_FILE, "[]")
+                pcall(writefile, VISITED_FILE, "{}")
             end
             local ok, s = pcall(readfile, VISITED_FILE)
             if ok and type(s) == "string" and #s > 0 then
                 local ok2, data = pcall(function() return HttpService:JSONDecode(s) end)
                 if ok2 and type(data) == "table" then
-                    raw = data
+                    db = data
                 end
             end
         end
+        -- Back-compat: if file was a flat array, convert it under current placeId
+        if #db > 0 then
+            db = { [tostring(placeId)] = db }
+        end
+
+        local key = tostring(placeId)
+        db[key] = db[key] or {}
+
+        -- Build set/list for current place
         local set, list = {}, {}
-        for _, id in ipairs(raw) do
+        for _, id in ipairs(db[key]) do
             if type(id) == "string" and not set[id] then
                 set[id] = true
                 table.insert(list, id)
             end
         end
-        return set, list
+        return db, key, set, list
     end
 
-    local function saveVisited(list)
+    local function saveVisited(db, key, list)
         if not hasFS then return end
+        -- trim
         while #list > MAX_KEEP do
             table.remove(list, 1)
         end
+        db[key] = list
         pcall(function()
-            writefile(VISITED_FILE, HttpService:JSONEncode(list))
+            writefile(VISITED_FILE, HttpService:JSONEncode(db))
         end)
     end
 
@@ -236,21 +248,23 @@ local function serverHop()
         return false, nil
     end
 
-    local visitedSet, visitedList = loadVisited()
+    local db, dbKey, visitedSet, visitedList = loadVisited()
 
     -- Always record the current server to skip it
     if not visitedSet[currentJobId] then
         visitedSet[currentJobId] = true
         table.insert(visitedList, currentJobId)
-        saveVisited(visitedList)
+        saveVisited(db, dbKey, visitedList)
     end
 
+    -- Gather candidates repeatedly until we find some
     local function collectCandidates(maxPages)
         maxPages = maxPages or 40
         local function fetch(order)
             local cursor = nil
             local fresh = {}
             local fallback = {}
+            local seen = {}
             for _ = 1, maxPages do
                 local url = string.format(
                     "https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=%s&limit=100%s",
@@ -267,9 +281,10 @@ local function serverHop()
                     local id = s and s.id
                     local playing = tonumber(s.playing) or 0
                     local maxPlayers = tonumber(s.maxPlayers) or 0
-                    if id and id ~= currentJobId and maxPlayers > 0 and playing < maxPlayers then
+                    if id and id ~= currentJobId and maxPlayers > 0 and playing < maxPlayers and not seen[id] then
+                        seen[id] = true
                         if not visitedSet[id] then
-                            table.insert(fresh, id) -- never visited
+                            table.insert(fresh, id) -- never visited in this place
                         else
                             table.insert(fallback, id) -- visited before, but not current
                         end
@@ -283,115 +298,107 @@ local function serverHop()
             return fresh, fallback
         end
 
-        local fresh1, fallback1 = fetch("Asc")
-        local fresh2, fallback2 = fetch("Desc")
+        local f1, fb1 = fetch("Asc")
+        local f2, fb2 = fetch("Desc")
 
         local combinedFresh, combinedFallback = {}, {}
-        for _, v in ipairs(fresh1) do table.insert(combinedFresh, v) end
-        for _, v in ipairs(fresh2) do table.insert(combinedFresh, v) end
-        for _, v in ipairs(fallback1) do table.insert(combinedFallback, v) end
-        for _, v in ipairs(fallback2) do table.insert(combinedFallback, v) end
+        for _, v in ipairs(f1) do table.insert(combinedFresh, v) end
+        for _, v in ipairs(f2) do table.insert(combinedFresh, v) end
+        for _, v in ipairs(fb1) do table.insert(combinedFallback, v) end
+        for _, v in ipairs(fb2) do table.insert(combinedFallback, v) end
 
         return combinedFresh, combinedFallback
     end
 
-    local function attemptTeleport(candidates)
-        local tried = {}
-        local idx = 1
+    -- Shuffle helper
+    local function shuffle(t)
+        for i = #t, 2, -1 do
+            local j = math.random(1, i)
+            t[i], t[j] = t[j], t[i]
+        end
+        return t
+    end
 
-        -- Reattempt on TeleportInitFailed with next candidate
-        local conn
-        conn = TeleportService.TeleportInitFailed:Connect(function(player, _result, _custom)
-            if player ~= LocalPlayer then return end
-            idx = idx + 1
-            if idx <= #candidates then
-                local nextId = candidates[idx]
-                if nextId and not tried[nextId] then
-                    tried[nextId] = true
-                    pcall(function()
-                        TeleportService:TeleportToPlaceInstance(placeId, nextId, LocalPlayer)
-                    end)
-                end
-            end
-        end)
+    -- Attempt loop with retries, backoff, and TeleportInitFailed bounce
+    local tried = {}
+    local pending = false
+    local lastAttemptTime = 0
 
-        -- Try the list sequentially
-        local okAny = false
-        for i = 1, #candidates do
-            local id = candidates[i]
+    local function attemptFromList(list)
+        for i = 1, #list do
+            local id = list[i]
             if id and not tried[id] then
                 tried[id] = true
-
-                -- Pre-mark to avoid re-picking on future runs
-                if not visitedSet[id] then
-                    visitedSet[id] = true
-                    table.insert(visitedList, id)
-                    saveVisited(visitedList)
-                end
-
+                pending = true
+                lastAttemptTime = tick()
                 local ok = pcall(function()
                     TeleportService:TeleportToPlaceInstance(placeId, id, LocalPlayer)
                 end)
-
                 if ok then
-                    okAny = true
-                    break
+                    -- Wait for teleport; TeleportInitFailed will trigger if it fails to init
+                    return true
                 else
-                    -- Undo pre-mark if the call itself failed immediately
-                    visitedSet[id] = nil
-                    for j = #visitedList, 1, -1 do
-                        if visitedList[j] == id then
-                            table.remove(visitedList, j)
-                            break
-                        end
-                    end
-                    saveVisited(visitedList)
+                    -- immediate failure; continue to next candidate
+                    pending = false
                 end
             end
         end
-
-        -- Leave the connection to handle init failures until teleport succeeds or we time out
-        task.delay(15, function()
-            if conn then conn:Disconnect() end
-        end)
-
-        return okAny
+        return false
     end
 
-    -- Build candidate lists
-    local fresh, fallback = collectCandidates(40)
+    -- If TeleportInitFailed fires, try next candidate immediately
+    local tConn
+    tConn = TeleportService.TeleportInitFailed:Connect(function(player)
+        if player ~= LocalPlayer then return end
+        pending = false
+    end)
 
-    -- Prefer fresh; if none, allow visited-but-not-current (prevents stalling)
-    local candidates = {}
-    if #fresh > 0 then
-        candidates = fresh
-    elseif #fallback > 0 then
-        candidates = fallback
-    else
-        -- Nothing available; trim the visited list a bit to widen choices next time
-        for _ = 1, 50 do
-            local old = table.remove(visitedList, 1)
-            if not old then break end
-            visitedSet[old] = nil
+    task.spawn(function()
+        local backoff = 1
+        while true do
+            -- Watchdog: if a call was made but no teleport nor init-failure for a while, reset pending
+            if pending and (tick() - lastAttemptTime) > 20 then
+                pending = false
+            end
+
+            if not pending then
+                -- Fetch candidates
+                local fresh, fallback = collectCandidates(60)
+                local candidates = {}
+
+                if #fresh > 0 then
+                    candidates = shuffle(fresh)
+                elseif #fallback > 0 then
+                    candidates = shuffle(fallback)
+                else
+                    -- Nothing right now; trim some very old visited to widen pool and retry later
+                    for _ = 1, 100 do
+                        local old = table.remove(visitedList, 1)
+                        if not old then break end
+                        visitedSet[old] = nil
+                    end
+                    saveVisited(db, dbKey, visitedList)
+                    task.wait(math.min(backoff, 10))
+                    backoff = backoff * 1.5
+                    goto continue
+                end
+
+                backoff = 1
+                local started = attemptFromList(candidates)
+                if not started then
+                    -- All candidates already tried in this session; clear tried and refetch next loop
+                    tried = {}
+                    task.wait(0.5)
+                else
+                    -- Wait until either teleport happens or init-failed resets 'pending'
+                    task.wait(0.5)
+                end
+            else
+                task.wait(0.5)
+            end
+            ::continue::
         end
-        saveVisited(visitedList)
-        -- Try fetching again quickly
-        fresh, fallback = collectCandidates(20)
-        if #fresh > 0 then candidates = fresh elseif #fallback > 0 then candidates = fallback end
-    end
-
-    if #candidates == 0 then
-        warn("serverHop: no candidates found; try again later")
-        return
-    end
-
-    -- Shuffle candidates to reduce same-order bias
-    for i = #candidates, 2, -1 do
-        local j = math.random(1, i)
-        candidates[i], candidates[j] = candidates[j], candidates[i]
-    end
-
-    attemptTeleport(candidates)
+    end)
 end
 
 -- -------------- Coordinator --------------
