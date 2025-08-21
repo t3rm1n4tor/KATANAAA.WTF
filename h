@@ -242,13 +242,13 @@ local state = {
 -- Initial humanoid health check → hop if 0
   while wait(0.5) do  
 local ss = game.Players.LocalPlayer:GetAttribute("HasDied")
-    if ss == true then
+    if ss then
         state.serverHopStarted = true
         serverHop()
     print("hop")
         break
-    elseif ss == false then
-    warn(tostring(ss))
+    elseif( game.Players.LocalPlayer.Character ~= nil and ss == nil then)
+    
 break
     end
 end
