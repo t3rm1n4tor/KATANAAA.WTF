@@ -247,8 +247,8 @@ local ss = game.Players.LocalPlayer:GetAttribute("HasDied")
         serverHop()
     print("hop")
         break
-    elseif( game.Players.LocalPlayer.Character ~= nil and ss == nil then)
-    
+    elseif( game.Players.LocalPlayer.Character ~= nil and ss == nil) then
+    warn("alive")
 break
     end
 end
