@@ -221,27 +221,29 @@ local function queueOnTeleportHello()
 end
 
 -- Drop-in replacement for serverHop() to avoid rejoining same server
+
+-- Safer server hop: prefers different servers, but always teleports (has fallback)
 local function serverHop()
     local Players = game:GetService("Players")
     local TeleportService = game:GetService("TeleportService")
     local HttpService = game:GetService("HttpService")
     local LocalPlayer = Players.LocalPlayer
-
-    -- Queue message for next server
-   queueOnTeleportHello()
-
     local placeId = game.PlaceId
     local currentJobId = game.JobId
 
-    -- Build visited set from TeleportData (persists across hops)
+    -- Keep your queued message
+    queueOnTeleportHello()
+
+    -- Build visited set from TeleportData (so we try to avoid recent servers)
     local tpIn = TeleportService:GetLocalPlayerTeleportData()
-    local visited = {}
+    local visitedSet, visitedList = {}, {}
     if tpIn and tpIn.VisitedServerIds then
         for _, id in ipairs(tpIn.VisitedServerIds) do
-            visited[id] = true
+            visitedSet[id] = true
+            table.insert(visitedList, id)
         end
     end
-    visited[currentJobId] = true
+    visitedSet[currentJobId] = true
 
     local function pickServerId()
         local function fetchPage(cursor, sortOrder)
@@ -258,55 +260,73 @@ local function serverHop()
             return data
         end
 
-        for _, sortOrder in ipairs({"Asc", "Desc"}) do
+        for _, order in ipairs({"Asc", "Desc"}) do
             local cursor = nil
-            for page = 1, 20 do
-                local data = fetchPage(cursor, sortOrder)
-                if not data or not data.data then break end
+            for _ = 1, 15 do
+                local data = fetchPage(cursor, order)
+                if not (data and data.data) then
+                    return nil -- Http disabled/blocked or bad response
+                end
 
                 local candidates = {}
                 for _, s in ipairs(data.data) do
                     local id = s and s.id
                     local playing = tonumber(s.playing) or 0
                     local maxPlayers = tonumber(s.maxPlayers) or 0
-                    if id and not visited[id] and maxPlayers > 0 and playing < maxPlayers then
+                    if id and not visitedSet[id] and maxPlayers > 0 and playing < maxPlayers then
                         table.insert(candidates, id)
                     end
                 end
 
                 if #candidates > 0 then
                     local rng = Random.new(os.clock())
-                    local idx = rng:NextInteger(1, #candidates)
-                    return candidates[idx]
+                    return candidates[rng:NextInteger(1, #candidates)]
                 end
 
                 cursor = data.nextPageCursor
                 if not cursor then break end
-                task.wait(0.1)
+                task.wait(0.05)
             end
         end
         return nil
     end
 
-    local targetId
-    local attempts = 0
-    while not targetId do
-        attempts += 1
-        targetId = pickServerId()
-        if not targetId then
-            task.wait(math.min(0.5 * attempts, 5)) -- backoff and retry
-        end
-    end
-
-    -- Append current server to visited list for the next hop
+    -- Prepare TeleportData to persist visited list
     local tpOut = tpIn or {}
-    tpOut.VisitedServerIds = tpOut.VisitedServerIds or {}
-    if #tpOut.VisitedServerIds >= 100 then
+    tpOut.VisitedServerIds = visitedList
+    table.insert(tpOut.VisitedServerIds, currentJobId)
+    while #tpOut.VisitedServerIds > 100 do
         table.remove(tpOut.VisitedServerIds, 1)
     end
-    table.insert(tpOut.VisitedServerIds, currentJobId)
 
-    TeleportService:TeleportToPlaceInstance(placeId, targetId, LocalPlayer, tpOut)
+    -- Try pick a specific different server; if not possible, fallback to random teleport
+    local targetId = pickServerId()
+
+    -- Retry on TeleportInitFailed by falling back to random teleport
+    local initFailedConn
+    initFailedConn = TeleportService.TeleportInitFailed:Connect(function(player)
+        if player == LocalPlayer then
+            pcall(function()
+                TeleportService:Teleport(placeId, LocalPlayer, tpOut)
+            end)
+        end
+    end)
+
+    local ok = false
+    if targetId then
+        ok = pcall(function()
+            TeleportService:TeleportToPlaceInstance(placeId, targetId, LocalPlayer, tpOut)
+        end)
+    end
+    if not ok then
+        pcall(function()
+            TeleportService:Teleport(placeId, LocalPlayer, tpOut)
+        end)
+    end
+
+    task.delay(10, function()
+        if initFailedConn then initFailedConn:Disconnect() end
+    end)
 end
 
 -- -------------- Coordinator --------------
