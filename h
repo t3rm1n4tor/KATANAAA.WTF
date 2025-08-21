@@ -19,6 +19,9 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local LocalPlayer = Players.LocalPlayer
 
+   
+    
+
 -- Remotes
 local RemoteEvents = ReplicatedStorage:WaitForChild("RemoteEvents")
 local OpenChestRE = RemoteEvents:WaitForChild("RequestOpenItemChest")
@@ -237,16 +240,18 @@ local state = {
 }
 
 -- Initial humanoid health check → hop if 0
-do
-    local hum = getHumanoid()
-    local ss = game.Players.LocalPlayer:GetAttribute("HasDied")
+  while wait(0.5) do  
+local ss = game.Players.LocalPlayer:GetAttribute("HasDied")
     if ss == true then
         state.serverHopStarted = true
         serverHop()
-        return
+    print("hop")
+        break
+    elseif ss == false then
+    warn(tostring(ss))
+break
     end
 end
-
 -- Diamond watcher: exact name "Diamond" only
 task.spawn(function()
     while not state.serverHopStarted do
