@@ -365,6 +365,7 @@ local function serverHop()
                 -- Fetch candidates
                 local fresh, fallback = collectCandidates(60)
                 local candidates = {}
+                local shouldSleep = false
 
                 if #fresh > 0 then
                     candidates = shuffle(fresh)
@@ -380,23 +381,24 @@ local function serverHop()
                     saveVisited(db, dbKey, visitedList)
                     task.wait(math.min(backoff, 10))
                     backoff = backoff * 1.5
-                    goto continue
+                    shouldSleep = true
                 end
 
-                backoff = 1
-                local started = attemptFromList(candidates)
-                if not started then
-                    -- All candidates already tried in this session; clear tried and refetch next loop
-                    tried = {}
-                    task.wait(0.5)
-                else
-                    -- Wait until either teleport happens or init-failed resets 'pending'
-                    task.wait(0.5)
+                if not shouldSleep then
+                    backoff = 1
+                    local started = attemptFromList(candidates)
+                    if not started then
+                        -- All candidates already tried in this session; clear tried and refetch next loop
+                        tried = {}
+                        task.wait(0.5)
+                    else
+                        -- Wait until either teleport happens or init-failed resets 'pending'
+                        task.wait(0.5)
+                    end
                 end
             else
                 task.wait(0.5)
             end
-            ::continue::
         end
     end)
 end
